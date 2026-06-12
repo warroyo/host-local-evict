@@ -18,7 +18,7 @@ Run this against the **Supervisor cluster** kubeconfig — that's where Cluster 
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.22+ (only required for building)
 - A kubeconfig pointing at the vSphere Supervisor cluster
 - RBAC permissions to:
   - `list` / `get` Machines and Clusters in the target namespace
