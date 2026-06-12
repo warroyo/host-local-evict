@@ -10,32 +10,22 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    strategy:
-      matrix:
-        goos: [linux, darwin]
-        goarch: [amd64, arm64]
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-        run: |
-          go build \
-            -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
-            -o host-local-evict-${{ matrix.goos }}-${{ matrix.goarch }} \
-            ./cmd
+      - name: Build all platforms
+        run: make build-all VERSION=${{ github.ref_name }}
 
-      - name: Upload release asset
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: host-local-evict-${{ matrix.goos }}-${{ matrix.goarch }}
+          files: dist/*
