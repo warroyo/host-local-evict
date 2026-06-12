@@ -135,14 +135,18 @@ This is a known CAPI constraint. The tool warns at plan time but won't block you
 
 ## Releasing
 
-Releases are cut by pushing a `v*` tag. The GitHub Actions release workflow builds binaries for all four platforms and publishes them as release assets with auto-generated notes.
-
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+make release VERSION=v0.2.0
 ```
 
-That's it. The tag triggers the workflow — no manual draft or upload needed.
+That validates the version format, checks for a clean working tree, tags, and pushes. The GitHub Actions release workflow takes it from there — builds binaries for all four platforms and publishes them as release assets with auto-generated notes.
+
+To build locally before releasing:
+
+```bash
+make build          # current platform, version from git tag
+make build-all      # all platforms into dist/
+```
 
 ## What's missing
 
