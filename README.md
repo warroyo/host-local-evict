@@ -133,6 +133,17 @@ The tool checks the server's discovery API and prefers `v1beta2` over `v1beta1`,
 
 This is a known CAPI constraint. The tool warns at plan time but won't block you.
 
+## Releasing
+
+Releases are cut by pushing a `v*` tag. The GitHub Actions release workflow builds binaries for all four platforms and publishes them as release assets with auto-generated notes.
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That's it. The tag triggers the workflow — no manual draft or upload needed.
+
 ## What's missing
 
 - **No drain/delete wait:** The tool fires and exits. It doesn't wait for Machines to actually drain and delete. With local storage, `nodeDrainTimeout` is the backstop — if a pod won't drain, CAPI force-deletes after that window. A `--wait` flag should eventually poll `Machine.status.phase` until each Machine reaches `Deleted`.
