@@ -1,6 +1,6 @@
 module github.com/warroyo/host-local-evict
 
-go 1.22.0
+go 1.26.3
 
 require (
 	k8s.io/apimachinery v0.30.0
