@@ -36,7 +36,7 @@ const (
 	capiGroup               = "cluster.x-k8s.io"
 	labelClusterName        = "cluster.x-k8s.io/cluster-name"
 	labelTopologyDeployName = "topology.cluster.x-k8s.io/deployment-name"
-	labelDeleteMachine      = "cluster.x-k8s.io/delete-machine"
+	annotationDeleteMachine = "cluster.x-k8s.io/delete-machine"
 	labelControlPlane       = "cluster.x-k8s.io/control-plane"
 	defaultHostLabel        = "node.cluster.x-k8s.io/esxi-host"
 )
@@ -201,7 +201,7 @@ func run(cfg config) error {
 	}
 
 	if len(standalone) > 0 {
-		fmt.Printf("WARNING: %d Machine(s) have no %s label; delete-machine will be\n"+
+		fmt.Printf("WARNING: %d Machine(s) have no %s label; delete-machine annotation will be\n"+
 			"applied but replica counts will NOT be adjusted:\n", len(standalone), labelTopologyDeployName)
 		for _, s := range standalone {
 			fmt.Printf("  %s\n", s)
@@ -258,8 +258,8 @@ func run(cfg config) error {
 	// Label each matched Machine so CAPI knows to delete it during scale-down.
 	labelPatch, err := json.Marshal(map[string]interface{}{
 		"metadata": map[string]interface{}{
-			"labels": map[string]interface{}{
-				labelDeleteMachine: "",
+			"annotations": map[string]interface{}{
+				annotationDeleteMachine: "",
 			},
 		},
 	})
@@ -338,7 +338,7 @@ func run(cfg config) error {
 	// Surface a --drain-timeout flag and wait here so callers can block on
 	// actual completion rather than fire-and-forget.
 
-	// TODO: implement --rollback: remove the delete-machine label from each Machine
+	// TODO: implement --rollback: remove the delete-machine annotation from each Machine
 	// and restore the original replica counts in the Cluster topology spec.
 
 	fmt.Println("\nDone. CAPI will now delete the marked Machines.")
@@ -417,7 +417,7 @@ func printPlan(cfg config, machines []unstructured.Unstructured, groups []*mdGro
 	}
 
 	fmt.Println()
-	fmt.Println("WARNING: The cluster.x-k8s.io/delete-machine label guarantees deletion")
+	fmt.Println("WARNING: The cluster.x-k8s.io/delete-machine annotation guarantees deletion")
 	fmt.Println("priority only during MachineSet scale-down. If a MachineDeployment is")
 	fmt.Println("mid-rollout with multiple live MachineSets, CAPI may shrink a different")
 	fmt.Println("MachineSet and leave the labeled Machines running. Verify no rollout is")

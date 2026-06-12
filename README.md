@@ -9,7 +9,7 @@ You need to put an ESXi host into maintenance mode, but the VMs on it use local 
 ## How it works
 
 1. Finds all CAPI `Machine` objects in a VKS workload cluster that are pinned to the target ESXi host (via label).
-2. Labels each Machine with `cluster.x-k8s.io/delete-machine=""` so CAPI selects them for deletion during scale-down.
+2. Annotates each Machine with `cluster.x-k8s.io/delete-machine=""` so CAPI selects them for deletion during scale-down.
 3. Scales down the matching entries in `Cluster.spec.topology.workers.machineDeployments[].replicas` to trigger deletion.
 
 The replica change goes through the **Cluster object**, not the MachineDeployment directly. On ClusterClass clusters the topology controller owns the MachineDeployment objects — a direct patch to them gets reverted on the next reconcile.
@@ -22,7 +22,7 @@ Run this against the **Supervisor cluster** kubeconfig — that's where Cluster 
 - A kubeconfig pointing at the vSphere Supervisor cluster
 - RBAC permissions to:
   - `list` / `get` Machines and Clusters in the target namespace
-  - `patch` Machines (to add the delete-machine label)
+  - `patch` Machines (to add the delete-machine annotation)
   - `patch` Clusters (to update `spec.topology.workers.machineDeployments[].replicas`)
 
 ## Install
@@ -116,7 +116,7 @@ The tool checks the server's discovery API and prefers `v1beta2` over `v1beta1`,
 
 ## Watch out for mid-rollout MachineDeployments
 
-> **Important:** The `cluster.x-k8s.io/delete-machine` label only guarantees
+> **Important:** The `cluster.x-k8s.io/delete-machine` annotation only guarantees
 > deletion priority during **MachineSet scale-down**. A MachineDeployment
 > controls which MachineSet to shrink — if a rollout is in progress with multiple
 > live MachineSets, CAPI may shrink the new one and completely skip the labeled
@@ -152,7 +152,7 @@ make build-all      # all platforms into dist/
 
 - **No drain/delete wait:** The tool fires and exits. It doesn't wait for Machines to actually drain and delete. With local storage, `nodeDrainTimeout` is the backstop — if a pod won't drain, CAPI force-deletes after that window. A `--wait` flag should eventually poll `Machine.status.phase` until each Machine reaches `Deleted`.
 
-- **No rollback:** To undo manually: remove the `cluster.x-k8s.io/delete-machine` label from each Machine, then restore the original replica counts in `Cluster.spec.topology.workers.machineDeployments[].replicas`.
+- **No rollback:** To undo manually: remove the `cluster.x-k8s.io/delete-machine` annotation from each Machine, then restore the original replica counts in `Cluster.spec.topology.workers.machineDeployments[].replicas`.
 
 - **Standalone Machines:** Machines without a `topology.cluster.x-k8s.io/deployment-name` label get the delete label applied, but their topology entry won't be scaled. These shouldn't exist in a normal VKS cluster, but the tool warns if it encounters them.
 
