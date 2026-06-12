@@ -25,14 +25,22 @@ Run this against the **Supervisor cluster** kubeconfig — that's where Cluster 
   - `patch` Machines (to add the delete-machine label)
   - `patch` Clusters (to update `spec.topology.workers.machineDeployments[].replicas`)
 
-## Build
+## Install
+
+**Download a pre-built binary** (Linux and macOS, amd64 and arm64):
+
+```bash
+curl -sSfL "https://github.com/warroyo/host-local-evict/releases/latest/download/host-local-evict-$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')" -o host-local-evict && chmod +x host-local-evict
+```
+
+**Build from source:**
 
 ```bash
 go mod tidy
 go build -o host-local-evict ./cmd
 ```
 
-Or install directly:
+**Install with Go:**
 
 ```bash
 go install github.com/warroyo/host-local-evict/cmd@latest
