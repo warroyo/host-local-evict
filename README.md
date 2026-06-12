@@ -150,7 +150,7 @@ make build-all      # all platforms into dist/
 
 ## What's missing
 
-- **No drain/delete wait:** The tool fires and exits. It doesn't wait for Machines to actually drain and delete. With local storage, `nodeDrainTimeout` is the backstop — if a pod won't drain, CAPI force-deletes after that window. A `--wait` flag should eventually poll `Machine.status.phase` until each Machine reaches `Deleted`.
+- **No completion wait:** The tool fires and exits. CAPI handles node drain as part of the scale-down process — `nodeDrainTimeout` is the backstop if a pod stalls. The tool doesn't poll for completion though; a `--wait` flag should eventually poll `Machine.status.phase` until each Machine reaches `Deleted`.
 
 - **No rollback:** To undo manually: remove the `cluster.x-k8s.io/delete-machine` annotation from each Machine, then restore the original replica counts in `Cluster.spec.topology.workers.machineDeployments[].replicas`.
 
