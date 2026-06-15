@@ -50,7 +50,8 @@ const (
 	capiGroup               = "cluster.x-k8s.io"
 	labelClusterName        = "cluster.x-k8s.io/cluster-name"
 	labelTopologyDeployName = "topology.cluster.x-k8s.io/deployment-name"
-	annotationDeleteMachine = "cluster.x-k8s.io/delete-machine"
+	annotationDeleteMachine    = "cluster.x-k8s.io/delete-machine"
+	annotationRemediateMachine = "cluster.x-k8s.io/remediate-machine"
 	labelControlPlane       = "cluster.x-k8s.io/control-plane"
 	defaultHostLabel        = "node.cluster.x-k8s.io/esxi-host"
 
@@ -65,6 +66,7 @@ type config struct {
 	hostLabel  string
 	apiVersion string
 	token      string
+	remediate  bool
 	dryRun     bool
 	yes        bool
 }
@@ -104,6 +106,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.hostLabel, "host-label", defaultHostLabel, "Machine label key carrying the ESXi host name")
 	flag.StringVar(&cfg.apiVersion, "api-version", "", "CAPI API version override (e.g. v1beta2); default: autodetect")
 	flag.StringVar(&cfg.token, "token", "", "bearer token for CAPI writes (skips ephemeral SA creation)")
+	flag.BoolVar(&cfg.remediate, "remediate", false, "replace Machines on a new host instead of permanently evicting (annotates remediate-machine, no replica scale-down)")
 	flag.BoolVar(&cfg.dryRun, "dry-run", false, "print plan only, perform no mutations")
 	flag.BoolVar(&cfg.yes, "yes", false, "skip confirmation prompt")
 	flag.Parse()
@@ -227,37 +230,38 @@ func run(cfg config) error {
 		}
 	}
 
-	// Read current replica counts from the Cluster object's topology spec.
-	// Patching the Cluster is the correct path for ClusterClass-based clusters —
-	// the topology controller owns the MachineDeployment objects and will overwrite
-	// direct patches to them.
-	clusterObj, err := adminDynClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
-	if err != nil {
-		return fmt.Errorf("get Cluster %s/%s: %w", clusterNS, cfg.cluster, err)
-	}
-
-	topologyMDs, found, err := unstructured.NestedSlice(clusterObj.Object, "spec", "topology", "workers", "machineDeployments")
-	if err != nil {
-		return fmt.Errorf("read spec.topology.workers.machineDeployments: %w", err)
-	}
-	if !found {
-		return fmt.Errorf("cluster %s/%s has no spec.topology.workers.machineDeployments; is this a ClusterClass cluster?", clusterNS, cfg.cluster)
-	}
-
-	replicasByName := make(map[string]int64, len(topologyMDs))
-	for _, entry := range topologyMDs {
-		mdEntry, ok := entry.(map[string]interface{})
-		if !ok {
-			continue
+	// For evict mode, read current replica counts from the Cluster topology spec
+	// so we can scale down. Remediate mode skips this — replica count stays the same.
+	var groups []*mdGroup
+	if !cfg.remediate {
+		clusterObj, err := adminDynClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get Cluster %s/%s: %w", clusterNS, cfg.cluster, err)
 		}
-		name, _ := mdEntry["name"].(string)
-		replicasByName[name] = toInt64(mdEntry["replicas"])
-	}
 
-	groups := make([]*mdGroup, 0, len(mdMap))
-	for _, grp := range mdMap {
-		grp.replicas = replicasByName[grp.topologyName]
-		groups = append(groups, grp)
+		topologyMDs, found, err := unstructured.NestedSlice(clusterObj.Object, "spec", "topology", "workers", "machineDeployments")
+		if err != nil {
+			return fmt.Errorf("read spec.topology.workers.machineDeployments: %w", err)
+		}
+		if !found {
+			return fmt.Errorf("cluster %s/%s has no spec.topology.workers.machineDeployments; is this a ClusterClass cluster?", clusterNS, cfg.cluster)
+		}
+
+		replicasByName := make(map[string]int64, len(topologyMDs))
+		for _, entry := range topologyMDs {
+			mdEntry, ok := entry.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			name, _ := mdEntry["name"].(string)
+			replicasByName[name] = toInt64(mdEntry["replicas"])
+		}
+
+		groups = make([]*mdGroup, 0, len(mdMap))
+		for _, grp := range mdMap {
+			grp.replicas = replicasByName[grp.topologyName]
+			groups = append(groups, grp)
+		}
 	}
 
 	printPlan(cfg, matched, groups, clusterNS)
@@ -268,7 +272,11 @@ func run(cfg config) error {
 	}
 
 	if !cfg.yes {
-		if !confirm("\nProceed with eviction?") {
+		prompt := "\nProceed with eviction?"
+		if cfg.remediate {
+			prompt = "\nProceed with remediation?"
+		}
+		if !confirm(prompt) {
 			fmt.Println("Aborted.")
 			return nil
 		}
@@ -312,7 +320,37 @@ func run(cfg config) error {
 
 	// Phase 3: mutations via write client.
 
-	// Annotate each matched Machine so CAPI marks it for deletion during scale-down.
+	if cfg.remediate {
+		// Remediate mode: annotate each Machine with remediate-machine. CAPI deletes
+		// the Machine and its MachineSet creates a replacement on a different host.
+		// Replica count is unchanged — the node comes back.
+		annotationPatch, err := json.Marshal(map[string]interface{}{
+			"metadata": map[string]interface{}{
+				"annotations": map[string]interface{}{
+					annotationRemediateMachine: "",
+				},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("marshal remediate annotation patch: %w", err)
+		}
+
+		for _, m := range matched {
+			fmt.Printf("Annotating Machine %s/%s for remediation...\n", m.GetNamespace(), m.GetName())
+			if _, err := writeClient.Resource(machineGVR).Namespace(m.GetNamespace()).Patch(
+				ctx, m.GetName(), types.MergePatchType, annotationPatch, metav1.PatchOptions{},
+			); err != nil {
+				return fmt.Errorf("annotate machine %s/%s: %w", m.GetNamespace(), m.GetName(), err)
+			}
+		}
+
+		fmt.Println("\nDone. CAPI will replace the marked Machines on a new host.")
+		fmt.Printf("Monitor with:\n  kubectl get machines -A -l %s=%s -w\n", labelClusterName, cfg.cluster)
+		return nil
+	}
+
+	// Evict mode: annotate each Machine for deletion priority, then scale down
+	// the Cluster topology so CAPI removes them.
 	annotationPatch, err := json.Marshal(map[string]interface{}{
 		"metadata": map[string]interface{}{
 			"annotations": map[string]interface{}{
@@ -340,12 +378,12 @@ func run(cfg config) error {
 	// objects; direct patches to them are overwritten on the next reconcile.
 	//
 	// Re-read the Cluster to get a fresh resourceVersion before mutating.
-	clusterObj, err = writeClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
+	clusterObj, err := writeClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("re-read Cluster %s/%s before patch: %w", clusterNS, cfg.cluster, err)
 	}
 
-	topologyMDs, _, err = unstructured.NestedSlice(clusterObj.Object, "spec", "topology", "workers", "machineDeployments")
+	topologyMDs, _, err := unstructured.NestedSlice(clusterObj.Object, "spec", "topology", "workers", "machineDeployments")
 	if err != nil {
 		return fmt.Errorf("re-read spec.topology.workers.machineDeployments: %w", err)
 	}
@@ -558,14 +596,30 @@ func toInt64(v interface{}) int64 {
 }
 
 func printPlan(cfg config, machines []unstructured.Unstructured, groups []*mdGroup, clusterNS string) {
+	mode := "evict"
+	if cfg.remediate {
+		mode = "remediate"
+	}
+
 	fmt.Println("\n=== Eviction Plan ===")
 	fmt.Printf("Cluster:    %s/%s\n", clusterNS, cfg.cluster)
 	fmt.Printf("ESXi host:  %s\n", cfg.esxHost)
 	fmt.Printf("Host label: %s\n", cfg.hostLabel)
+	fmt.Printf("Mode:       %s\n", mode)
 
-	fmt.Printf("\nMachines to evict (%d):\n", len(machines))
+	noun := "evict"
+	if cfg.remediate {
+		noun = "remediate"
+	}
+	fmt.Printf("\nMachines to %s (%d):\n", noun, len(machines))
 	for _, m := range machines {
 		fmt.Printf("  %s/%s\n", m.GetNamespace(), m.GetName())
+	}
+
+	if cfg.remediate {
+		fmt.Println("\nReplica counts will NOT change. CAPI will delete each Machine and")
+		fmt.Println("let the MachineSet create a replacement on a different host.")
+		return
 	}
 
 	if len(groups) > 0 {

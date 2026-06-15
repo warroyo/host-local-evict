@@ -58,6 +58,7 @@ go install github.com/warroyo/host-local-evict/cmd@latest
 | `--host-label` | `node.cluster.x-k8s.io/esxi-host` | Machine label key that holds the ESXi host name |
 | `--api-version` | autodetect | Override CAPI API version (e.g. `v1beta2`) |
 | `--token` | *(none)* | Bearer token for CAPI writes; skips ephemeral SA creation |
+| `--remediate` | `false` | Replace Machines on a new host instead of permanently evicting (no replica scale-down) |
 | `--dry-run` | `false` | Print the plan; make no mutations |
 | `--yes` | `false` | Skip the confirmation prompt |
 
@@ -96,6 +97,22 @@ go install github.com/warroyo/host-local-evict/cmd@latest
 
 ```bash
 ./host-local-evict ... --api-version v1beta1
+```
+
+## Remediate vs evict
+
+The tool has two modes.
+
+**Evict (default):** Annotates Machines with `cluster.x-k8s.io/delete-machine` and scales down the replica counts in `Cluster.spec.topology.workers.machineDeployments`. The Machines are permanently removed from the cluster. Use this when you are decommissioning a host or replacing it.
+
+**Remediate (`--remediate`):** Annotates Machines with `cluster.x-k8s.io/remediate-machine` instead. CAPI deletes each Machine and lets the MachineSet create a replacement on a different host. Replica count stays the same — you end up with the same number of nodes, just placed elsewhere. Use this when the host is going into temporary maintenance and you want the workload back when it returns, but can't vMotion because of local storage.
+
+```bash
+./host-local-evict \
+  --cluster my-cluster \
+  --esx-host esxi01.example.com \
+  --namespace my-vsphere-ns \
+  --remediate
 ```
 
 ## Before you run
