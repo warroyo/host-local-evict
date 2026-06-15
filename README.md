@@ -18,12 +18,13 @@ Run this against the **Supervisor cluster** kubeconfig — that's where Cluster 
 
 ## Prerequisites
 
-- Go 1.26+ (only required for building)
+- Go 1.26+ (only required for building from source)
 - A kubeconfig pointing at the vSphere Supervisor cluster
-- RBAC permissions to:
-  - `list` / `get` Machines and Clusters in the target namespace
-  - `patch` Machines (to add the delete-machine annotation)
-  - `patch` Clusters (to update `spec.topology.workers.machineDeployments[].replicas`)
+- **Namespace edit permissions** in the target vSphere namespace
+
+Admission policies on Supervisor clusters block direct CAPI writes from regular user credentials. The tool works around this by creating an ephemeral service account with the minimum required permissions, performing all CAPI writes through that account, and deleting it on exit. Your user credentials only need to be able to manage namespace-scoped RBAC resources (ServiceAccount, Role, RoleBinding).
+
+If you'd rather supply your own service account token, pass `--token $(kubectl create token <sa-name> -n <namespace>)` — the tool skips SA creation entirely in that case.
 
 ## Install
 
@@ -56,6 +57,7 @@ go install github.com/warroyo/host-local-evict/cmd@latest
 | `--kubeconfig` | `$KUBECONFIG` or `~/.kube/config` | Path to Supervisor kubeconfig |
 | `--host-label` | `node.cluster.x-k8s.io/esxi-host` | Machine label key that holds the ESXi host name |
 | `--api-version` | autodetect | Override CAPI API version (e.g. `v1beta2`) |
+| `--token` | *(none)* | Bearer token for CAPI writes; skips ephemeral SA creation |
 | `--dry-run` | `false` | Print the plan; make no mutations |
 | `--yes` | `false` | Skip the confirmation prompt |
 

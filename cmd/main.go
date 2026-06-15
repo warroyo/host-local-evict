@@ -5,6 +5,13 @@
 // MachineDeployment replica counts in the Cluster object so CAPI removes them
 // in a controlled way.
 //
+// The tool must be run as a user with namespace edit permissions in the target
+// vSphere namespace. Because admission policies on Supervisor clusters block
+// direct CAPI writes from user credentials, the tool creates an ephemeral
+// service account with minimal CAPI permissions, performs writes through that
+// account, then deletes it on exit. Pass --token to skip SA creation and use
+// a pre-existing service account token instead.
+//
 // Run this against the vSphere Supervisor cluster kubeconfig (where Cluster
 // API lives), not the workload cluster kubeconfig.
 package main
@@ -18,13 +25,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	authv1 "k8s.io/api/authentication/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
 )
@@ -39,6 +53,8 @@ const (
 	annotationDeleteMachine = "cluster.x-k8s.io/delete-machine"
 	labelControlPlane       = "cluster.x-k8s.io/control-plane"
 	defaultHostLabel        = "node.cluster.x-k8s.io/esxi-host"
+
+	ephemeralSATokenExpiry = int64(900) // 15 minutes
 )
 
 type config struct {
@@ -48,6 +64,7 @@ type config struct {
 	esxHost    string
 	hostLabel  string
 	apiVersion string
+	token      string
 	dryRun     bool
 	yes        bool
 }
@@ -86,6 +103,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.esxHost, "esx-host", "", "ESXi host FQDN/name to evacuate (required)")
 	flag.StringVar(&cfg.hostLabel, "host-label", defaultHostLabel, "Machine label key carrying the ESXi host name")
 	flag.StringVar(&cfg.apiVersion, "api-version", "", "CAPI API version override (e.g. v1beta2); default: autodetect")
+	flag.StringVar(&cfg.token, "token", "", "bearer token for CAPI writes (skips ephemeral SA creation)")
 	flag.BoolVar(&cfg.dryRun, "dry-run", false, "print plan only, perform no mutations")
 	flag.BoolVar(&cfg.yes, "yes", false, "skip confirmation prompt")
 	flag.Parse()
@@ -108,17 +126,18 @@ func parseFlags() config {
 func run(cfg config) error {
 	ctx := context.Background()
 
-	restCfg, err := clientcmd.BuildConfigFromFlags("", cfg.kubeconfig)
+	// Phase 1: admin client — all reads and SA lifecycle management.
+	adminRestCfg, err := clientcmd.BuildConfigFromFlags("", cfg.kubeconfig)
 	if err != nil {
 		return fmt.Errorf("load kubeconfig %q: %w", cfg.kubeconfig, err)
 	}
 
-	dynClient, err := dynamic.NewForConfig(restCfg)
+	adminDynClient, err := dynamic.NewForConfig(adminRestCfg)
 	if err != nil {
 		return fmt.Errorf("create dynamic client: %w", err)
 	}
 
-	discClient, err := discovery.NewDiscoveryClientForConfig(restCfg)
+	discClient, err := discovery.NewDiscoveryClientForConfig(adminRestCfg)
 	if err != nil {
 		return fmt.Errorf("create discovery client: %w", err)
 	}
@@ -140,9 +159,9 @@ func run(cfg config) error {
 
 	var rawList *unstructured.UnstructuredList
 	if cfg.namespace != "" {
-		rawList, err = dynClient.Resource(machineGVR).Namespace(cfg.namespace).List(ctx, listOpts)
+		rawList, err = adminDynClient.Resource(machineGVR).Namespace(cfg.namespace).List(ctx, listOpts)
 	} else {
-		rawList, err = dynClient.Resource(machineGVR).List(ctx, listOpts)
+		rawList, err = adminDynClient.Resource(machineGVR).List(ctx, listOpts)
 	}
 	if err != nil {
 		return fmt.Errorf("list machines in cluster %q: %w", cfg.cluster, err)
@@ -212,7 +231,7 @@ func run(cfg config) error {
 	// Patching the Cluster is the correct path for ClusterClass-based clusters —
 	// the topology controller owns the MachineDeployment objects and will overwrite
 	// direct patches to them.
-	clusterObj, err := dynClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
+	clusterObj, err := adminDynClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("get Cluster %s/%s: %w", clusterNS, cfg.cluster, err)
 	}
@@ -255,8 +274,46 @@ func run(cfg config) error {
 		}
 	}
 
-	// Label each matched Machine so CAPI knows to delete it during scale-down.
-	labelPatch, err := json.Marshal(map[string]interface{}{
+	// Phase 2: set up the write client.
+	//
+	// Admission policies on Supervisor clusters block direct CAPI writes from
+	// user credentials. Service accounts bypass this. Either use a token the
+	// caller supplies (--token) or create an ephemeral SA with minimal CAPI
+	// permissions, use it for all mutations, and delete it on exit.
+	var writeClient dynamic.Interface
+
+	if cfg.token != "" {
+		writeClient, err = tokenDynClient(adminRestCfg, cfg.token)
+		if err != nil {
+			return fmt.Errorf("build token client: %w", err)
+		}
+	} else {
+		coreClient, err := kubernetes.NewForConfig(adminRestCfg)
+		if err != nil {
+			return fmt.Errorf("create core client: %w", err)
+		}
+
+		saName, token, cleanup, err := createEphemeralSA(ctx, coreClient, clusterNS)
+		if err != nil {
+			return fmt.Errorf("create ephemeral service account: %w", err)
+		}
+		defer func() {
+			fmt.Printf("Cleaning up ephemeral service account %s/%s...\n", clusterNS, saName)
+			if err := cleanup(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: SA cleanup failed: %v\n", err)
+			}
+		}()
+
+		writeClient, err = tokenDynClient(adminRestCfg, token)
+		if err != nil {
+			return fmt.Errorf("build SA token client: %w", err)
+		}
+	}
+
+	// Phase 3: mutations via write client.
+
+	// Annotate each matched Machine so CAPI marks it for deletion during scale-down.
+	annotationPatch, err := json.Marshal(map[string]interface{}{
 		"metadata": map[string]interface{}{
 			"annotations": map[string]interface{}{
 				annotationDeleteMachine: "",
@@ -264,17 +321,17 @@ func run(cfg config) error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("marshal label patch: %w", err)
+		return fmt.Errorf("marshal annotation patch: %w", err)
 	}
 
 	for _, m := range matched {
-		fmt.Printf("Labeling Machine %s/%s...\n", m.GetNamespace(), m.GetName())
+		fmt.Printf("Annotating Machine %s/%s for deletion...\n", m.GetNamespace(), m.GetName())
 		// TODO: collect per-machine errors and continue rather than aborting on first
 		// failure; report all failures at the end with per-machine exit codes.
-		if _, err := dynClient.Resource(machineGVR).Namespace(m.GetNamespace()).Patch(
-			ctx, m.GetName(), types.MergePatchType, labelPatch, metav1.PatchOptions{},
+		if _, err := writeClient.Resource(machineGVR).Namespace(m.GetNamespace()).Patch(
+			ctx, m.GetName(), types.MergePatchType, annotationPatch, metav1.PatchOptions{},
 		); err != nil {
-			return fmt.Errorf("label machine %s/%s: %w", m.GetNamespace(), m.GetName(), err)
+			return fmt.Errorf("annotate machine %s/%s: %w", m.GetNamespace(), m.GetName(), err)
 		}
 	}
 
@@ -283,7 +340,7 @@ func run(cfg config) error {
 	// objects; direct patches to them are overwritten on the next reconcile.
 	//
 	// Re-read the Cluster to get a fresh resourceVersion before mutating.
-	clusterObj, err = dynClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
+	clusterObj, err = writeClient.Resource(clusterGVR).Namespace(clusterNS).Get(ctx, cfg.cluster, metav1.GetOptions{})
 	if err != nil {
 		return fmt.Errorf("re-read Cluster %s/%s before patch: %w", clusterNS, cfg.cluster, err)
 	}
@@ -326,7 +383,7 @@ func run(cfg config) error {
 		return fmt.Errorf("marshal Cluster topology patch: %w", err)
 	}
 
-	if _, err := dynClient.Resource(clusterGVR).Namespace(clusterNS).Patch(
+	if _, err := writeClient.Resource(clusterGVR).Namespace(clusterNS).Patch(
 		ctx, cfg.cluster, types.MergePatchType, scalePatch, metav1.PatchOptions{},
 	); err != nil {
 		return fmt.Errorf("patch Cluster %s/%s topology replicas: %w", clusterNS, cfg.cluster, err)
@@ -345,6 +402,114 @@ func run(cfg config) error {
 	fmt.Printf("Monitor with:\n  kubectl get machines -A -l %s=%s -w\n", labelClusterName, cfg.cluster)
 
 	return nil
+}
+
+// createEphemeralSA creates a ServiceAccount, Role, and RoleBinding in namespace
+// with the minimum permissions required for CAPI eviction writes. It returns the
+// SA name, a short-lived bearer token, and a cleanup function that deletes all
+// three resources. The cleanup function uses a background context so it runs even
+// if the caller's context has been cancelled.
+func createEphemeralSA(ctx context.Context, coreClient kubernetes.Interface, namespace string) (saName string, token string, cleanup func() error, err error) {
+	suffix := time.Now().UnixMilli()
+	saName = fmt.Sprintf("host-local-evict-%d", suffix)
+	roleName := saName
+	bindingName := saName
+
+	fmt.Printf("Creating ephemeral service account %s/%s...\n", namespace, saName)
+
+	sa := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: saName, Namespace: namespace},
+	}
+	if _, err = coreClient.CoreV1().ServiceAccounts(namespace).Create(ctx, sa, metav1.CreateOptions{}); err != nil {
+		return "", "", nil, fmt.Errorf("create ServiceAccount: %w", err)
+	}
+
+	role := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: roleName, Namespace: namespace},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{capiGroup},
+				Resources: []string{"machines"},
+				Verbs:     []string{"patch"},
+			},
+			{
+				APIGroups: []string{capiGroup},
+				Resources: []string{"clusters"},
+				Verbs:     []string{"get", "patch"},
+			},
+		},
+	}
+	if _, err = coreClient.RbacV1().Roles(namespace).Create(ctx, role, metav1.CreateOptions{}); err != nil {
+		_ = coreClient.CoreV1().ServiceAccounts(namespace).Delete(ctx, saName, metav1.DeleteOptions{})
+		return "", "", nil, fmt.Errorf("create Role: %w", err)
+	}
+
+	rb := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: bindingName, Namespace: namespace},
+		Subjects: []rbacv1.Subject{
+			{Kind: "ServiceAccount", Name: saName, Namespace: namespace},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     roleName,
+		},
+	}
+	if _, err = coreClient.RbacV1().RoleBindings(namespace).Create(ctx, rb, metav1.CreateOptions{}); err != nil {
+		_ = coreClient.CoreV1().ServiceAccounts(namespace).Delete(ctx, saName, metav1.DeleteOptions{})
+		_ = coreClient.RbacV1().Roles(namespace).Delete(ctx, roleName, metav1.DeleteOptions{})
+		return "", "", nil, fmt.Errorf("create RoleBinding: %w", err)
+	}
+
+	expiry := ephemeralSATokenExpiry
+	tokenReq, err := coreClient.CoreV1().ServiceAccounts(namespace).CreateToken(ctx, saName, &authv1.TokenRequest{
+		Spec: authv1.TokenRequestSpec{ExpirationSeconds: &expiry},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		_ = coreClient.CoreV1().ServiceAccounts(namespace).Delete(ctx, saName, metav1.DeleteOptions{})
+		_ = coreClient.RbacV1().Roles(namespace).Delete(ctx, roleName, metav1.DeleteOptions{})
+		_ = coreClient.RbacV1().RoleBindings(namespace).Delete(ctx, bindingName, metav1.DeleteOptions{})
+		return "", "", nil, fmt.Errorf("request token: %w", err)
+	}
+
+	cleanup = func() error {
+		cleanCtx := context.Background()
+		var errs []string
+		if e := coreClient.CoreV1().ServiceAccounts(namespace).Delete(cleanCtx, saName, metav1.DeleteOptions{}); e != nil && !k8serrors.IsNotFound(e) {
+			errs = append(errs, fmt.Sprintf("delete SA: %v", e))
+		}
+		if e := coreClient.RbacV1().Roles(namespace).Delete(cleanCtx, roleName, metav1.DeleteOptions{}); e != nil && !k8serrors.IsNotFound(e) {
+			errs = append(errs, fmt.Sprintf("delete Role: %v", e))
+		}
+		if e := coreClient.RbacV1().RoleBindings(namespace).Delete(cleanCtx, bindingName, metav1.DeleteOptions{}); e != nil && !k8serrors.IsNotFound(e) {
+			errs = append(errs, fmt.Sprintf("delete RoleBinding: %v", e))
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		return nil
+	}
+
+	return saName, tokenReq.Status.Token, cleanup, nil
+}
+
+// tokenDynClient builds a dynamic client that authenticates with a bearer token,
+// copying server and TLS settings from base but replacing all credential fields.
+func tokenDynClient(base *rest.Config, token string) (dynamic.Interface, error) {
+	cfg := &rest.Config{
+		Host: base.Host,
+		TLSClientConfig: rest.TLSClientConfig{
+			Insecure:   base.TLSClientConfig.Insecure,
+			ServerName: base.TLSClientConfig.ServerName,
+			CAFile:     base.TLSClientConfig.CAFile,
+			CAData:     base.TLSClientConfig.CAData,
+		},
+		BearerToken: token,
+		QPS:         base.QPS,
+		Burst:       base.Burst,
+		Timeout:     base.Timeout,
+	}
+	return dynamic.NewForConfig(cfg)
 }
 
 // resolveCAPIVersion returns the best available cluster.x-k8s.io API version
@@ -371,7 +536,6 @@ func resolveCAPIVersion(disc discovery.DiscoveryInterface, override string) (str
 				}
 			}
 		}
-		// Unexpected version; use whatever the server advertises first.
 		if len(grp.Versions) > 0 {
 			return grp.Versions[0].Version, nil
 		}
