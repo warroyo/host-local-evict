@@ -4,7 +4,7 @@
 [![Go version](https://img.shields.io/github/go-mod/go-version/warroyo/host-local-evict)](go.mod)
 [![Latest release](https://img.shields.io/github/v/release/warroyo/host-local-evict?include_prereleases)](https://github.com/warroyo/host-local-evict/releases)
 
-You need to put an ESXi host into maintenance mode, but the VMs on it use local storage. vMotion won't work. Draining the Kubernetes nodes isn't enough either — the CAPI Machines are still there, still bound to the host. This tool handles the CAPI side of that.
+host-local-evict evacuates CAPI Machines from a VMware ESXi host that is attempting to go into maintenence mode. VMs backed by local storage can't vMotion, so this tool marks the affected Machines for deletion and scales down the Cluster topology replicas to trigger controlled removal. This provides an automated clean approach to putting hosts into maintenence mode when the local storage is being used by VKS worker nodes.
 
 ## How it works
 
@@ -103,9 +103,9 @@ go install github.com/warroyo/host-local-evict/cmd@latest
 
 The tool has two modes.
 
-**Evict (default):** Annotates Machines with `cluster.x-k8s.io/delete-machine` and scales down the replica counts in `Cluster.spec.topology.workers.machineDeployments`. The Machines are permanently removed from the cluster. Use this when you are decommissioning a host or replacing it.
+**Evict (default):** Annotates Machines with `cluster.x-k8s.io/delete-machine` and scales down the replica counts in `Cluster.spec.topology.workers.machineDeployments`. Use this when your cluster is sized with a fixed number of worker nodes per physical host — removing a host means the worker count should drop to match. The Machines are deleted and the replica count permanently reflects the smaller fleet.
 
-**Remediate (`--remediate`):** Annotates Machines with `cluster.x-k8s.io/remediate-machine` instead. CAPI deletes each Machine and lets the MachineSet create a replacement on a different host. Replica count stays the same — you end up with the same number of nodes, just placed elsewhere. Use this when the host is going into temporary maintenance and you want the workload back when it returns, but can't vMotion because of local storage.
+**Remediate (`--remediate`):** Annotates Machines with `cluster.x-k8s.io/remediate-machine` instead. CAPI deletes each Machine and lets the MachineSet create a replacement on a different host. Replica count stays the same. Use this when you want to maintain a consistent total worker count regardless of which hosts are active — nodes move off the host going into maintenance and land elsewhere.
 
 ```bash
 ./host-local-evict \
